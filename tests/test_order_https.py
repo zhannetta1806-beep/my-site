@@ -56,8 +56,10 @@ class OrderHttpsTests(unittest.TestCase):
             self.db_path.unlink()
         self.previous_db = db.DB_PATH
         self.previous_proxy = os.environ.get("TRUSTED_PROXY_IPS")
+        self.previous_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
         db.DB_PATH = self.db_path
         os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
         server.LEAD_POSTS.clear()
         self.httpd = server.Server(("127.0.0.1", 0), QuietHandler)
         self.port = self.httpd.server_address[1]
@@ -73,6 +75,10 @@ class OrderHttpsTests(unittest.TestCase):
             os.environ.pop("TRUSTED_PROXY_IPS", None)
         else:
             os.environ["TRUSTED_PROXY_IPS"] = self.previous_proxy
+        if self.previous_domain is None:
+            os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
+        else:
+            os.environ["RAILWAY_PUBLIC_DOMAIN"] = self.previous_domain
         server.LEAD_POSTS.clear()
 
     def origin(self):
@@ -236,39 +242,44 @@ class OrderHttpsTests(unittest.TestCase):
         self.assertEqual(allowed, 201)
         self.assertEqual(body.get("id"), "limitother")
 
-    def test_railway_private_proxy_enables_https_and_secure_cookie(self):
-        previous_project = os.environ.get("RAILWAY_PROJECT_ID")
-        previous_cidrs = os.environ.get("TRUSTED_PROXY_CIDRS")
+    def test_private_ranges_are_not_trusted_without_explicit_proxy(self):
         os.environ["RAILWAY_PROJECT_ID"] = "audit-project"
+        os.environ["RAILWAY_PUBLIC_DOMAIN"] = "audit.example"
         os.environ["TRUSTED_PROXY_IPS"] = ""
         os.environ.pop("TRUSTED_PROXY_CIDRS", None)
         try:
-            proxy = QuietHandler.__new__(QuietHandler)
-            proxy.client_address = ("10.9.8.7", 9)
-            proxy.headers = {
-                "X-Forwarded-Proto": "https",
-                "X-Forwarded-For": "198.51.100.20, 203.0.113.50",
+            for address in ("10.9.8.7", "100.64.8.8", "172.16.0.4", "192.168.1.9", "203.0.113.9"):
+                self.assertFalse(server.peer_is_trusted(address))
+                handler = QuietHandler.__new__(QuietHandler)
+                handler.client_address = (address, 9)
+                handler.headers = {
+                    "Host": "internal.example",
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "audit.example",
+                    "X-Forwarded-For": "198.51.100.20",
+                    "X-Real-IP": "198.51.100.20",
+                }
+                self.assertFalse(handler.request_is_https())
+                self.assertEqual(handler.client_ip(), address)
+                self.assertNotIn("Secure", handler.session_cookie("token"))
+            public = QuietHandler.__new__(QuietHandler)
+            public.client_address = ("100.64.8.8", 9)
+            public.headers = {
+                "Host": "audit.example",
+                "X-Forwarded-Proto": "http",
+                "X-Forwarded-Host": "evil.example",
+                "X-Real-IP": "198.51.100.20",
             }
-            cookie = proxy.session_cookie("token")
+            self.assertTrue(public.request_is_https())
+            self.assertFalse(server.peer_is_trusted("100.64.8.8"))
+            self.assertEqual(public.client_ip(), "100.64.8.8")
+            cookie = public.session_cookie("token")
             self.assertIn("HttpOnly", cookie)
             self.assertIn("SameSite=Strict", cookie)
             self.assertIn("Secure", cookie)
-            self.assertEqual(proxy.client_ip(), "203.0.113.50")
-            outsider = QuietHandler.__new__(QuietHandler)
-            outsider.client_address = ("203.0.113.9", 9)
-            outsider.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-For": "198.51.100.8"}
-            self.assertNotIn("Secure", outsider.session_cookie("token"))
-            self.assertEqual(outsider.client_ip(), "203.0.113.9")
-            self.assertFalse(outsider.request_is_https())
         finally:
-            if previous_project is None:
-                os.environ.pop("RAILWAY_PROJECT_ID", None)
-            else:
-                os.environ["RAILWAY_PROJECT_ID"] = previous_project
-            if previous_cidrs is None:
-                os.environ.pop("TRUSTED_PROXY_CIDRS", None)
-            else:
-                os.environ["TRUSTED_PROXY_CIDRS"] = previous_cidrs
+            os.environ.pop("RAILWAY_PROJECT_ID", None)
+            os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
 
     def test_secure_cookie_follows_trusted_https_only(self):
         handler = QuietHandler.__new__(QuietHandler)

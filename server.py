@@ -50,12 +50,6 @@ RAILWAY_KEYS = (
     "RAILWAY_ENVIRONMENT_NAME",
     "RAILWAY_SERVICE_ID",
 )
-RAILWAY_PROXY_NETWORKS = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("fc00::/7"),
-)
 
 
 def railway_runtime():
@@ -182,22 +176,29 @@ def parse_ip(value):
 
 
 def trusted_proxy_networks():
-    """Точные IP задаются отдельно. Сети Railway включаются только на самой Railway и без своего списка IP."""
+    """Только сети из TRUSTED_PROXY_CIDRS. Широкие частные сети сами не доверяются."""
     raw = os.environ.get("TRUSTED_PROXY_CIDRS", "").strip()
-    if raw:
-        networks = []
-        for item in raw.split(","):
-            text = item.strip()
-            if not text:
-                continue
-            try:
-                networks.append(ipaddress.ip_network(text, strict=False))
-            except ValueError:
-                continue
-        return networks
-    if railway_runtime() and not os.environ.get("TRUSTED_PROXY_IPS", "").strip():
-        return list(RAILWAY_PROXY_NETWORKS)
-    return []
+    networks = []
+    for item in raw.split(","):
+        text = item.strip()
+        if not text:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def public_site_host():
+    """Публичное имя сайта из RAILWAY_PUBLIC_DOMAIN. Запрос этого значения не задаёт."""
+    raw = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if not raw or any(char in raw for char in " /,@\\"):
+        return ""
+    host = canonical_netloc(raw, "https")
+    if not host or ":" in host or host.startswith("."):
+        return ""
+    return host
 
 
 def peer_is_trusted(ip):
@@ -220,6 +221,15 @@ def visitor_from_forwarded(value):
     if any(item is None for item in parsed):
         return ""
     return str(parsed[-1])
+
+
+def single_forwarded_ip(value):
+    """Один адрес. Список и пробелы не принимаются: их мог прислать не прокси."""
+    text = str(value or "").strip()
+    if not text or "," in text or any(char.isspace() for char in text):
+        return ""
+    parsed = parse_ip(text)
+    return str(parsed) if parsed is not None else ""
 
 
 def forwarded_proto(value):
@@ -654,17 +664,28 @@ class Handler(SimpleHTTPRequestHandler):
         return self.client_address[0]
 
     def client_ip(self):
-        """Адрес для лимита. Чужой X-Forwarded-For не подменяет прямое соединение."""
+        """Адрес для лимита. Чужие X-Real-IP и X-Forwarded-For не подменяют прямое соединение."""
         peer = self.peer_ip()
         if not peer_is_trusted(peer):
             return peer
-        return visitor_from_forwarded(self.headers.get("X-Forwarded-For", "")) or peer
+        return (
+            single_forwarded_ip(self.headers.get("X-Real-IP", ""))
+            or visitor_from_forwarded(self.headers.get("X-Forwarded-For", ""))
+            or peer
+        )
 
     def request_is_https(self):
-        """HTTPS только если соединение пришло от доверенного прокси и тот прислал одно значение https."""
-        if not peer_is_trusted(self.peer_ip()):
+        """HTTPS от явного прокси либо для публичного имени Railway.
+
+        Совпадение Host и Origin не делает отправителя доверенным прокси:
+        X-Forwarded-Proto при этом не читается.
+        """
+        if peer_is_trusted(self.peer_ip()):
+            return forwarded_proto(self.headers.get("X-Forwarded-Proto", "")) == "https"
+        expected = public_site_host()
+        if not expected:
             return False
-        return forwarded_proto(self.headers.get("X-Forwarded-Proto", "")) == "https"
+        return canonical_netloc(self.headers.get("Host", ""), "https") == expected
 
     def browser_host(self):
         """Адрес страницы в браузере.

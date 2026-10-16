@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import unittest
@@ -24,6 +25,7 @@ ENV_KEYS = (
     "TRUSTED_PROXY_IPS",
     "TRUSTED_PROXY_CIDRS",
     "RAILWAY_PROJECT_ID",
+    "RAILWAY_PUBLIC_DOMAIN",
     "ALLOW_DB_INIT",
     "BACKUP_DIR",
     "SITE_DB_PATH",
@@ -66,7 +68,9 @@ class HostingPrepTests(unittest.TestCase):
         self.saved_env = {key: os.environ.get(key) for key in ENV_KEYS}
         self.saved_password = (server.PASSWORD_SALT, server.PASSWORD_DIGEST, server.PASSWORD_STATE)
         self.folder = Path(os.environ.get("TEMP", ".")) / "sanexpert-hosting-tests" / self.id().replace(".", "_")
-        self.folder.mkdir(parents=True, exist_ok=True)
+        if self.folder.exists():
+            shutil.rmtree(self.folder)
+        self.folder.mkdir(parents=True)
         self.previous_db = db.DB_PATH
 
     def tearDown(self):
@@ -293,6 +297,250 @@ class HostingPrepTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
+
+    def serve_as(self, peer):
+        class PeerHandler(QuietHandler):
+            def setup(self):
+                super().setup()
+                self.client_address = peer
+
+        httpd = server.Server(("127.0.0.1", 0), PeerHandler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        return httpd, port, thread
+
+    def stop_server(self, httpd, thread):
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+    def test_railway_edge_https_allows_login_and_lead(self):
+        database = self.folder / "crm.sqlite"
+        db.DB_PATH = database
+        os.environ["RAILWAY_PUBLIC_DOMAIN"] = "audit.example"
+        os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("TRUSTED_PROXY_CIDRS", None)
+        os.environ["ADMIN_PASSWORD"] = "Railway-Test-9182"
+        server.configure_password()
+        server.SESSIONS.clear()
+        server.LEAD_POSTS.clear()
+        server.LOGIN_FAILURES.clear()
+        httpd, port, thread = self.serve_as(("100.64.8.8", 443))
+        try:
+            self.assertFalse(server.peer_is_trusted("100.64.8.8"))
+            headers = {
+                "Host": "audit.example",
+                "Origin": "https://audit.example",
+                "X-Forwarded-Proto": "http",
+                "X-Forwarded-Host": "evil.example",
+                "X-Real-IP": "203.0.113.40",
+            }
+            status, body, response_headers = self.exchange(
+                port,
+                "POST",
+                "/api/login",
+                {"password": "Railway-Test-9182"},
+                headers,
+                include_headers=True,
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("csrfToken"))
+            cookie = response_headers.get("Set-Cookie", "")
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertIn("Secure", cookie)
+            lead_status, lead_body = self.exchange(
+                port,
+                "POST",
+                "/api/leads",
+                {
+                    "id": "railway-lead",
+                    "name": "Тест",
+                    "contact": "+7 700 000 00 20",
+                    "object": "Другое",
+                    "message": "Заявка через Railway",
+                    "services": ["Санитарный аудит объекта"],
+                },
+                headers,
+            )
+            self.assertEqual(lead_status, 201)
+            self.assertEqual(lead_body.get("id"), "railway-lead")
+            self.assertIn("100.64.8.8", server.LEAD_POSTS)
+            self.assertNotIn("203.0.113.40", server.LEAD_POSTS)
+            forged, _ = self.exchange(
+                port,
+                "PATCH",
+                "/api/leads/railway-lead",
+                {"status": "work"},
+                {**headers, "Cookie": cookie.split(";", 1)[0]},
+            )
+            self.assertEqual(forged, 403)
+            saved, _ = self.exchange(
+                port,
+                "PATCH",
+                "/api/leads/railway-lead",
+                {"status": "work"},
+                {**headers, "Cookie": cookie.split(";", 1)[0], "X-CSRF-Token": body["csrfToken"]},
+            )
+            self.assertEqual(saved, 200)
+        finally:
+            self.stop_server(httpd, thread)
+
+    def test_railway_environment_does_not_trust_a_public_peer(self):
+        database = self.folder / "crm.sqlite"
+        db.DB_PATH = database
+        os.environ["RAILWAY_PUBLIC_DOMAIN"] = "audit.example"
+        os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("TRUSTED_PROXY_CIDRS", None)
+        os.environ["ADMIN_PASSWORD"] = "Railway-Test-9182"
+        server.configure_password()
+        server.SESSIONS.clear()
+        server.LEAD_POSTS.clear()
+        httpd, port, thread = self.serve_as(("203.0.113.9", 443))
+        try:
+            forged = {
+                "Host": f"127.0.0.1:{port}",
+                "Origin": "https://audit.example",
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "audit.example",
+                "X-Real-IP": "198.51.100.10",
+                "X-Forwarded-For": "198.51.100.10",
+            }
+            login_status, login_body = self.exchange(
+                port,
+                "POST",
+                "/api/login",
+                {"password": "Railway-Test-9182"},
+                forged,
+            )
+            self.assertEqual(login_status, 403)
+            self.assertEqual(login_body.get("error"), "Запрос отклонён.")
+            lead_status, _ = self.exchange(
+                port,
+                "POST",
+                "/api/leads",
+                {
+                    "id": "forged-lead",
+                    "name": "Тест",
+                    "contact": "+7 700 000 00 21",
+                    "object": "Другое",
+                    "message": "Поддельный прокси",
+                    "services": [],
+                },
+                forged,
+            )
+            self.assertEqual(lead_status, 403)
+            self.assertNotIn("198.51.100.10", server.LEAD_POSTS)
+            self.assertFalse(database.exists())
+        finally:
+            self.stop_server(httpd, thread)
+
+    def test_railway_edge_rejects_wrong_origin_and_header_lists(self):
+        database = self.folder / "crm.sqlite"
+        db.DB_PATH = database
+        os.environ["RAILWAY_PUBLIC_DOMAIN"] = "audit.example"
+        os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("TRUSTED_PROXY_CIDRS", None)
+        httpd, port, thread = self.serve_as(("100.64.8.8", 443))
+        try:
+            wrong, body = self.exchange(
+                port,
+                "POST",
+                "/api/leads",
+                {
+                    "id": "wrong-origin",
+                    "name": "Тест",
+                    "contact": "+7 700 000 00 22",
+                    "object": "Другое",
+                    "message": "Чужой сайт",
+                    "services": [],
+                },
+                {
+                    "Host": "audit.example",
+                    "Origin": "https://evil.example",
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "evil.example",
+                },
+            )
+            self.assertEqual(wrong, 403)
+            self.assertEqual(body.get("error"), "Запрос отклонён.")
+            downgraded, _ = self.exchange(
+                port,
+                "POST",
+                "/api/leads",
+                {
+                    "id": "http-origin",
+                    "name": "Тест",
+                    "contact": "+7 700 000 00 23",
+                    "object": "Другое",
+                    "message": "Обычный HTTP",
+                    "services": [],
+                },
+                {
+                    "Host": "audit.example",
+                    "Origin": "http://audit.example",
+                    "X-Forwarded-Proto": "https, http",
+                    "X-Forwarded-Host": "audit.example",
+                },
+            )
+            self.assertEqual(downgraded, 403)
+            self.assertFalse(database.exists())
+        finally:
+            self.stop_server(httpd, thread)
+
+    def test_local_request_ignores_forwarded_headers(self):
+        database = self.folder / "crm.sqlite"
+        db.DB_PATH = database
+        os.environ.pop("RAILWAY_PROJECT_ID", None)
+        os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
+        os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("TRUSTED_PROXY_CIDRS", None)
+        server.LEAD_POSTS.clear()
+        httpd, port, thread = self.serve_as(("127.0.0.1", 9))
+        try:
+            self.assertFalse(server.peer_is_trusted("100.64.8.8"))
+            forged, _ = self.exchange(
+                port,
+                "POST",
+                "/api/leads",
+                {
+                    "id": "local-forged",
+                    "name": "Тест",
+                    "contact": "+7 700 000 00 24",
+                    "object": "Другое",
+                    "message": "Локальная подделка",
+                    "services": [],
+                },
+                {
+                    "Origin": "https://audit.example",
+                    "Host": f"127.0.0.1:{port}",
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "audit.example",
+                    "X-Real-IP": "198.51.100.10",
+                },
+            )
+            self.assertEqual(forged, 403)
+            status, body = self.exchange(
+                port,
+                "POST",
+                "/api/leads",
+                {
+                    "id": "local-lead",
+                    "name": "Тест",
+                    "contact": "+7 700 000 00 25",
+                    "object": "Другое",
+                    "message": "Локальная заявка",
+                    "services": [],
+                },
+                {"Origin": f"http://127.0.0.1:{port}", "Host": f"127.0.0.1:{port}"},
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(body.get("id"), "local-lead")
+            self.assertIn("127.0.0.1", server.LEAD_POSTS)
+            self.assertNotIn("198.51.100.10", server.LEAD_POSTS)
+        finally:
+            self.stop_server(httpd, thread)
 
     def exchange(self, port, method, path, payload=None, headers=None, include_headers=False):
         data = None if payload is None else json.dumps(payload).encode("utf-8")
