@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -43,16 +44,36 @@ LOGIN_FAILURES = {}
 LEAD_POSTS = {}
 
 
+RAILWAY_KEYS = (
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_ENVIRONMENT_NAME",
+    "RAILWAY_SERVICE_ID",
+)
+RAILWAY_PROXY_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
+)
+
+
+def railway_runtime():
+    return any(os.environ.get(key, "").strip() for key in RAILWAY_KEYS)
+
+
 def site_port():
-    raw = os.environ.get("SITE_PORT", "")
-    if raw.isdigit() and 1 <= int(raw) <= 65535:
-        return int(raw)
+    """PORT задаёт Railway. Локальный запуск и Compose используют SITE_PORT, затем 8080."""
+    for key in ("PORT", "SITE_PORT"):
+        raw = os.environ.get(key, "").strip()
+        if raw.isdigit() and 1 <= int(raw) <= 65535:
+            return int(raw)
     return 8080
 
 
 def site_host():
-    """Локальный запуск слушает только этот компьютер. 0.0.0.0 нужен контейнеру."""
-    if os.environ.get("SITE_HOST", "").strip() == "0.0.0.0":
+    """Локальный запуск слушает только этот компьютер. Контейнер и Railway слушают 0.0.0.0."""
+    if railway_runtime() or os.environ.get("SITE_HOST", "").strip() == "0.0.0.0":
         return "0.0.0.0"
     return "127.0.0.1"
 
@@ -71,7 +92,15 @@ def password_is_strong(value):
 def load_local_env():
     """Читает локальный .env. Уже заданные переменные окружения не перекрывает и ничего не печатает."""
     env_path = (ROOT / ".env").resolve()
-    allowed = {"ADMIN_PASSWORD", "SITE_HOST", "SITE_PORT", "TRUSTED_PROXY_IPS"}
+    allowed = {
+        "ADMIN_PASSWORD",
+        "SITE_HOST",
+        "SITE_PORT",
+        "TRUSTED_PROXY_IPS",
+        "TRUSTED_PROXY_CIDRS",
+        "ALLOW_DB_INIT",
+        "BACKUP_DIR",
+    }
     try:
         if env_path.parent != ROOT or not env_path.is_file() or env_path.stat().st_size > 16384:
             return
@@ -138,6 +167,59 @@ def same_secret(left, right):
 
 def trusted_proxy_ips():
     return {item.strip() for item in os.environ.get("TRUSTED_PROXY_IPS", "").split(",") if item.strip()}
+
+
+def parse_ip(value):
+    text = str(value or "").strip()
+    if text.startswith("[") and "]" in text:
+        text = text[1:text.index("]")]
+    try:
+        parsed = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    return mapped or parsed
+
+
+def trusted_proxy_networks():
+    """Точные IP задаются отдельно. Сети Railway включаются только на самой Railway и без своего списка IP."""
+    raw = os.environ.get("TRUSTED_PROXY_CIDRS", "").strip()
+    if raw:
+        networks = []
+        for item in raw.split(","):
+            text = item.strip()
+            if not text:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(text, strict=False))
+            except ValueError:
+                continue
+        return networks
+    if railway_runtime() and not os.environ.get("TRUSTED_PROXY_IPS", "").strip():
+        return list(RAILWAY_PROXY_NETWORKS)
+    return []
+
+
+def peer_is_trusted(ip):
+    parsed = parse_ip(ip)
+    if parsed is None:
+        return False
+    for item in trusted_proxy_ips():
+        other = parse_ip(item)
+        if item == ip or (other is not None and other == parsed):
+            return True
+    return any(parsed in network for network in trusted_proxy_networks())
+
+
+def visitor_from_forwarded(value):
+    """Правый адрес добавлен ближайшим прокси. Список с мусором не принимается."""
+    parts = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    if not parts:
+        return ""
+    parsed = [parse_ip(item) for item in parts]
+    if any(item is None for item in parsed):
+        return ""
+    return str(parsed[-1])
 
 
 def forwarded_proto(value):
@@ -568,24 +650,31 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
-    def client_ip(self):
+    def peer_ip(self):
         return self.client_address[0]
 
+    def client_ip(self):
+        """Адрес для лимита. Чужой X-Forwarded-For не подменяет прямое соединение."""
+        peer = self.peer_ip()
+        if not peer_is_trusted(peer):
+            return peer
+        return visitor_from_forwarded(self.headers.get("X-Forwarded-For", "")) or peer
+
     def request_is_https(self):
-        """HTTPS только если соединение пришло от прокси из TRUSTED_PROXY_IPS и тот прислал одно значение https."""
-        if self.client_ip() not in trusted_proxy_ips():
+        """HTTPS только если соединение пришло от доверенного прокси и тот прислал одно значение https."""
+        if not peer_is_trusted(self.peer_ip()):
             return False
         return forwarded_proto(self.headers.get("X-Forwarded-Proto", "")) == "https"
 
     def browser_host(self):
         """Адрес страницы в браузере.
 
-        X-Forwarded-Host учитывается только у TCP-соединения из TRUSTED_PROXY_IPS.
+        X-Forwarded-Host учитывается только у TCP-соединения доверенного прокси.
         От прямого посетителя и от локального процесса вне этого списка заголовок игнорируется.
         Прокси должен заменять заголовок своим значением, а не дописывать значение посетителя.
         """
         host = self.headers.get("Host", "")
-        if self.client_ip() not in trusted_proxy_ips():
+        if not peer_is_trusted(self.peer_ip()):
             return host
         return forwarded_host(self.headers.get("X-Forwarded-Host", "")) or host
 
@@ -601,7 +690,7 @@ class Handler(SimpleHTTPRequestHandler):
         site_host = canonical_netloc(self.browser_host(), scheme)
         if parsed.scheme == scheme and origin_host and origin_host == site_host:
             return True
-        return self.client_ip() in {"127.0.0.1", "::1"} and origin in DEV_ORIGINS
+        return self.peer_ip() in {"127.0.0.1", "::1"} and origin in DEV_ORIGINS
 
     def read_cookie(self):
         header = self.headers.get("Cookie", "")

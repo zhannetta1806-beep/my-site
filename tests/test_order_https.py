@@ -205,6 +205,71 @@ class OrderHttpsTests(unittest.TestCase):
         status, _ = self.post(self.lead("order-test-8"), spoofed)
         self.assertEqual(status, 403)
 
+    def test_forged_forwarded_for_does_not_replace_the_direct_address(self):
+        os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("RAILWAY_PROJECT_ID", None)
+        headers = {
+            "Origin": self.origin(),
+            "Host": f"127.0.0.1:{self.port}",
+            "X-Forwarded-For": "198.51.100.10",
+            "X-Forwarded-Proto": "https",
+        }
+        status, _ = self.post(self.lead("order-test-forge"), headers)
+        self.assertEqual(status, 201)
+        self.assertIn("127.0.0.1", server.LEAD_POSTS)
+        self.assertNotIn("198.51.100.10", server.LEAD_POSTS)
+
+    def test_trusted_proxy_limits_each_forwarded_visitor(self):
+        os.environ["TRUSTED_PROXY_IPS"] = "127.0.0.1"
+        first = {
+            "Origin": self.origin(),
+            "Host": f"127.0.0.1:{self.port}",
+            "X-Forwarded-For": "198.51.100.10",
+        }
+        for index in range(20):
+            status, _ = self.post(self.lead(f"limit{index}"), first)
+            self.assertEqual(status, 201, index)
+        blocked, _ = self.post(self.lead("limitblocked"), first)
+        self.assertEqual(blocked, 429)
+        second = {**first, "X-Forwarded-For": "198.51.100.11"}
+        allowed, body = self.post(self.lead("limitother"), second)
+        self.assertEqual(allowed, 201)
+        self.assertEqual(body.get("id"), "limitother")
+
+    def test_railway_private_proxy_enables_https_and_secure_cookie(self):
+        previous_project = os.environ.get("RAILWAY_PROJECT_ID")
+        previous_cidrs = os.environ.get("TRUSTED_PROXY_CIDRS")
+        os.environ["RAILWAY_PROJECT_ID"] = "audit-project"
+        os.environ["TRUSTED_PROXY_IPS"] = ""
+        os.environ.pop("TRUSTED_PROXY_CIDRS", None)
+        try:
+            proxy = QuietHandler.__new__(QuietHandler)
+            proxy.client_address = ("10.9.8.7", 9)
+            proxy.headers = {
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-For": "198.51.100.20, 203.0.113.50",
+            }
+            cookie = proxy.session_cookie("token")
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertIn("Secure", cookie)
+            self.assertEqual(proxy.client_ip(), "203.0.113.50")
+            outsider = QuietHandler.__new__(QuietHandler)
+            outsider.client_address = ("203.0.113.9", 9)
+            outsider.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-For": "198.51.100.8"}
+            self.assertNotIn("Secure", outsider.session_cookie("token"))
+            self.assertEqual(outsider.client_ip(), "203.0.113.9")
+            self.assertFalse(outsider.request_is_https())
+        finally:
+            if previous_project is None:
+                os.environ.pop("RAILWAY_PROJECT_ID", None)
+            else:
+                os.environ["RAILWAY_PROJECT_ID"] = previous_project
+            if previous_cidrs is None:
+                os.environ.pop("TRUSTED_PROXY_CIDRS", None)
+            else:
+                os.environ["TRUSTED_PROXY_CIDRS"] = previous_cidrs
+
     def test_secure_cookie_follows_trusted_https_only(self):
         handler = QuietHandler.__new__(QuietHandler)
         handler.client_address = ("127.0.0.1", 9)
