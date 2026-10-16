@@ -1,0 +1,22 @@
+{
+  "name": "my-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/assistant.test.js tests/order-flow.test.js tests/site-i18n.test.js"
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.4.299",
+    "pdfmake": "0.3.11",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.9.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "vite": "^7.1.9"
+  }
+}

@@ -1,0 +1,28 @@
+# Локальные Vite :5173 и Python :8080 не занимаются.
+# Сайт в контейнере: http://127.0.0.1:8088/
+# Не запускайте контейнер одновременно с локальным python server.py: оба пишут в data/crm.sqlite.
+# Не используйте docker compose down -v: база лежит в папке data, а не в томе Docker.
+
+name: my-site
+
+services:
+  site:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: my-site:local
+    init: true
+    restart: "no"
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      SITE_HOST: "0.0.0.0"
+      SITE_PORT: "8080"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
